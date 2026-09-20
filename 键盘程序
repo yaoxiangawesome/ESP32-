@@ -1,0 +1,142 @@
+#include <BleKeyboard.h>
+#include "esp_sleep.h"
+#include "driver/gpio.h"
+
+BleKeyboard bleKeyboard("要想的ESP32");
+
+#define PIN_RIGHT  14
+#define PIN_C      26
+#define PIN_V      32
+#define PIN_CTRL   18
+#define PIN_BOOT   0    /* 板载 BOOT 键(GPIO0)，作断电开关 */
+
+int lastR = 1, lastC = 1, lastV = 1, lastCtrl = 1;
+int bootLast = 1;       /* BOOT 上次电平：1松开 / 0按下 */
+
+/* 右键：方案C —— 按下后等判定窗口再动作；窗口内松开=单击跳格，
+   窗口后仍按住=长按直接二倍速（不再先误跳一格） */
+unsigned long rPressAt = 0;             // 右键按下的时刻
+bool   rLong   = false;                 // 是否已判定为长按(二倍速)
+bool   rDown   = false;                 // 当前物理是否按下
+const unsigned long RIGHT_MS   = 80;    // 判定窗口(ms)：单击/长按分界
+
+/* Ctrl 键双击识别（单击=按住Ctrl，双击=全选 Ctrl+A） */
+unsigned long ctrlRelAt = 0;            // Ctrl 上次松开时刻
+bool   ctrlHadClick = false;            // 是否有过一次单击
+const unsigned long CTRL_DBLMS = 200;   // 双击窗口(ms)
+
+#ifndef LED_BUILTIN
+  #define LED_BUILTIN 2
+#endif
+
+void setup() {
+  Serial.begin(115200);
+  pinMode(PIN_RIGHT, INPUT_PULLUP);
+  pinMode(PIN_C,     INPUT_PULLUP);
+  pinMode(PIN_V,     INPUT_PULLUP);
+  pinMode(PIN_CTRL,  INPUT_PULLUP);
+  pinMode(PIN_BOOT,  INPUT_PULLUP);
+  pinMode(LED_BUILTIN, OUTPUT);
+  gpio_hold_dis(GPIO_NUM_2);         // 唤醒后先解除 GPIO2 保持，避免LED被锁死
+  bleKeyboard.begin();
+  Serial.println("4-key ready. Right: tap=single, hold=2x. Press BOOT = power OFF.");
+  Serial.println("Press BOOT again = power ON (restart).");
+}
+
+void loop() {
+  long now = millis();
+  static long lastT = 0;
+
+  if (now - lastT < 2) return;   // 2ms scan period（加快响应）
+  lastT = now;
+
+  /* LED：未连蓝牙快闪，已连蓝牙常亮 */
+  if (bleKeyboard.isConnected()) digitalWrite(LED_BUILTIN, HIGH);
+  else digitalWrite(LED_BUILTIN, (now / 150) % 2);
+
+  /* BOOT：松开时断电（Deep Sleep）。松开时GPIO0为高不会被立即唤醒；
+     再按BOOT(变低) 才会唤醒重启 */
+  int boot = digitalRead(PIN_BOOT);
+  if (boot == HIGH && bootLast == LOW) {   // 松开沿触发
+    delay(40);                             // 消抖
+    if (digitalRead(PIN_BOOT) == HIGH) {
+      Serial.println("[断电] 进入深睡，电流≈0，再按 BOOT 开机");
+      Serial.flush();
+      digitalWrite(LED_BUILTIN, LOW);   // 熄灭 D2
+      gpio_set_direction(GPIO_NUM_2, GPIO_MODE_OUTPUT);
+      gpio_set_level(GPIO_NUM_2, 0);    // 确保低电平
+      gpio_hold_en(GPIO_NUM_2);         // 保持 GPIO2，深睡期间保持熄灭
+      gpio_deep_sleep_hold_en();
+      /* 让 BOOT 键(GPIO0) 低电平时唤醒(按下即开机) */
+      esp_sleep_enable_ext0_wakeup(GPIO_NUM_0, 0);
+      esp_deep_sleep_start();   // 深度睡眠(≈断电)，之后这里不会返回
+    }
+  }
+  bootLast = boot;
+
+  /* —— 4 键功能 —— */
+  int r = digitalRead(PIN_RIGHT);
+  int c = digitalRead(PIN_C);
+  int v = digitalRead(PIN_V);
+  int ct = digitalRead(PIN_CTRL);
+
+  /* -------- 右键（方案C）：等120ms判定；窗口内松开=单击跳格，
+     窗口后仍按住=长按直接二倍速，不再先误跳一格 -------- */
+  if (r == LOW && lastR == HIGH) {          // 按下沿：先记录，不立即发
+    rPressAt = now;
+    rLong = false;
+    rDown = true;
+  }
+  if (rDown && !rLong && (now - rPressAt) >= RIGHT_MS) {
+    // 判定窗口结束且仍按住 → 长按：直接二倍速，不先跳格
+    rLong = true;
+    bleKeyboard.press(KEY_RIGHT_ARROW);     // 持续按住→二倍速
+    Serial.println("右键：长按 → 二倍速");
+  }
+  if (r == HIGH && lastR == LOW) {          // 松开沿
+    rDown = false;
+    if (rLong) {
+      bleKeyboard.release(KEY_RIGHT_ARROW); // 结束二倍速
+      rLong = false;
+      Serial.println("右键：结束长按");
+    } else {
+      bleKeyboard.write(KEY_RIGHT_ARROW);   // 窗口内松开=单击：跳一格
+      Serial.println("右键：单击 → 快进一格");
+    }
+  }
+  lastR = r;
+
+  // C: tap once（不 releaseAll，保持 Ctrl 原状，可配合 Ctrl+C 连续复制）
+  if (c == LOW && lastC == HIGH) {
+    bleKeyboard.press('c');
+    delay(5);
+    bleKeyboard.release('c');
+  }
+  lastC = c;
+
+  // V: tap once（立即响应，配合Ctrl=粘贴）
+  if (v == LOW && lastV == HIGH) {
+    bleKeyboard.press('v');
+    delay(5);
+    bleKeyboard.release('v');
+  }
+  lastV = v;
+
+  // CTRL: 单击=按住(配合C/V组合)；松开后快速再按=双击全选 Ctrl+A
+  if (ct == LOW && lastCtrl == HIGH) {          // 按下沿
+    if (ctrlHadClick && (now - ctrlRelAt) < CTRL_DBLMS) {  // 双击
+      ctrlHadClick = false;
+      bleKeyboard.press(KEY_LEFT_CTRL);
+      bleKeyboard.write('a');                     // Ctrl+A 全选
+      bleKeyboard.release(KEY_LEFT_CTRL);
+      Serial.println("Ctrl：双击 → 全选 Ctrl+A");
+    } else {                                      // 单击：按住保持
+      ctrlHadClick = true;
+      bleKeyboard.press(KEY_LEFT_CTRL);
+    }
+  } else if (ct == HIGH && lastCtrl == LOW) {    // 松开沿
+    ctrlRelAt = now;
+    bleKeyboard.release(KEY_LEFT_CTRL);
+  }
+  lastCtrl = ct;
+}
