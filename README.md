@@ -7,3 +7,4 @@
 - 模具直自己用纸壳弄，长宽均为15cm、高为5cm，即可。
 - 注意要用Arduino IDE 进行编程
 - 需要在GITHUB上找专属的蓝牙协议插件
+- 蓝牙插件地址：https://github.com/T-vK/ESP32-BLE-Keyboard
